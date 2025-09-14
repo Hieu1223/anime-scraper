@@ -1,48 +1,69 @@
+import os
 import json
-from lxml import html
-import re
+import logging
 import requests
+from lxml import html
+from tqdm import tqdm
 
+# --- Config ---
+BASE_URL = "https://wibu47.com"
+STATE_FILE = "state.json"
+INDEX_FILE = "animes.json"
+ANIME_DIR = "animes"
+MAX_PAGE = 193
 
+os.makedirs(ANIME_DIR, exist_ok=True)
+
+# --- Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("scraper.log", encoding="utf-8", mode="w"),
+        logging.StreamHandler()
+    ]
+)
+
+# --- State ---
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"page": 0, "anime_idx": 0, "anime_id": 0}
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+# --- Anime Index ---
+def load_index():
+    if os.path.exists(INDEX_FILE):
+        with open(INDEX_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_index(index):
+    with open(INDEX_FILE, "w", encoding="utf-8") as f:
+        json.dump(index, f, ensure_ascii=False, indent=2)
+
+# --- Utils ---
 def get_page_link(page: int):
-    return f"https://wibu47.com/the-loai/anime?page={page}"
-
-
-def extract_mirrors(tree):
-    scripts = tree.xpath('//script')
-    pattern = r'var\s+(\w+)\s*=\s*"((?:https?://)[^"]+)"'
-    result = {}
-    for script in scripts:
-        script_text = script.text or ""
-        for var, url in re.findall(pattern, script_text):
-            result[var] = url
-    return result
-
-
-base_url = "https://wibu47.com"
-
+    return f"{BASE_URL}/the-loai/anime?page={page}"
 
 def parse_anime_article(article):
     data = {}
-
     link = article.xpath('.//a/@href')
-    data['link'] = base_url + link[0] if link else None
-
+    data['link'] = BASE_URL + link[0] if link else None
     img = article.xpath('.//img[contains(@class,"wp-post-image")]/@src')
     data['thumbnail'] = img[0] if img else None
-
     episode = article.xpath('.//span[@class="mli-eps"]/text()')
     data['episode'] = episode[0].strip() if episode else None
-
     rating = article.xpath('.//div[contains(@class,"anime-avg-user-rating")]/text()')
     data['rating'] = rating[0].strip() if rating else None
-
     title = article.xpath('.//h2[@class="Title"]/text()')
     data['title'] = title[0].strip() if title else None
-
     views = article.xpath('.//span[@class="Year"]/text()')
     data['views'] = views[0].replace('Lượt xem:', '').strip() if views else None
-
     info = article.xpath('.//p[@class="Info"]')
     if info:
         info = info[0]
@@ -56,102 +77,60 @@ def parse_anime_article(article):
         data['date'] = d[0].strip() if d else None
     else:
         data['quality'] = data['vote'] = data['time'] = data['date'] = None
-
     desc = article.xpath('.//div[@class="Description"]/p[1]/text()')
     data['description'] = desc[0].strip() if desc else None
-
     genre = article.xpath('.//p[contains(@class,"Genre")]/span/text()')
     data['genre'] = genre[0].replace('Thể loại:', '').strip() if genre else None
-
     return data
-
 
 def get_animes_in_page(page):
     return page.find_class("TPost C post-943 post type-post status-publish format-standard has-post-thumbnail hentry")
 
-
-def get_entry_point(info_page):
-    panel = info_page.find_class("InfoList")[0]
-    first_link = panel.xpath('//li[@class="AAIco-adjust latest_eps"]/a[@href]/@href')
-    return first_link
-
-
-def get_chapter_links(watch_page):
-    panel = watch_page.find_class("list-episode tab-pane ABList")[0]
-    links = panel.xpath('.//li/a[@href]')
-    return [(a.text.strip() if a.text else '', base_url + a.get('href')) for a in links]
-
-
-def get_watch_link(film_detail_url: str, chapter):
-    return film_detail_url.replace("phim", "xem-phim") + str(chapter)
-
-
-def get_valid_watch_link(links):
-    for link in links:
-        if link[-1] != '/':
-            return link
-    return None
-
-
+# --- Main ---
 def main():
-    MAX_PAGE = 193
-    exception = []
-    episode_get_exception = []
-    movies = []
-    too_long_skip = []
+    state = load_state()
+    index = load_index()
 
-    for page_num in range(MAX_PAGE):
-        print(f"Processing page {page_num + 1}/{MAX_PAGE}")
+    for page_num in range(state["page"], MAX_PAGE):
+        try:
+            page_html = requests.get(get_page_link(page_num)).text
+            page = html.fromstring(page_html)
+            animes = get_animes_in_page(page)
+        except Exception as e:
+            logging.error(f"Failed to fetch page {page_num+1}: {e}")
+            break
 
-        page = get_page_link(page_num)
-        page = requests.get(page).text
-        page = html.fromstring(page)
-        animes = get_animes_in_page(page)
-
-        for idx, anime in enumerate(animes):
-            print(f"Anime {idx + 1}/{len(animes)} on page {page_num + 1}")
+        for idx in tqdm(range(state["anime_idx"], len(animes)), desc=f"Page {page_num+1}", unit="anime"):
+            anime = animes[idx]
             info = parse_anime_article(anime)
-            link = info['link']
-            try:
-                anime_page = requests.get(link).text
-                anime_page = html.fromstring(anime_page)
-                entry_points = get_entry_point(anime_page)
-                entry_point = get_valid_watch_link(entry_points)
-                if entry_point is None:
-                    exception.append({"error": "no entry_point", "link": link})
-                    continue
 
-                entry_point = base_url + entry_point
-                entry_point = requests.get(entry_point).text
-                entry_point = html.fromstring(entry_point)
-                chapter_links = get_chapter_links(entry_point)
-                episodes = []
+            if not info.get("title"):
+                continue
 
-                for episode_num, watch_link in chapter_links:
-                    episode = {}
-                    print(f"Episode link: {watch_link}")
-                    try:
-                        watch_page = html.fromstring(requests.get(watch_link).text)
-                        mirrors = extract_mirrors(watch_page)
-                        episode["ep"] = episode_num
-                        episode["mirrors"] = mirrors
-                        episodes.append(episode)
-                    except Exception as e:
-                        print(f"Episode {episode_num} failed: {e}")
-                        episode_get_exception.append(
-                            {"error": str(e), "anime": link, "episode": episode_num}
-                        )
+            # Skip duplicate by checking title in index
+            if any(entry["title"] == info["title"] for entry in index.values()):
+                logging.info(f"Skipping duplicate: {info['title']}")
+            else:
+                state["anime_id"] += 1
+                anime_id = str(state["anime_id"])
+                filename = os.path.join(ANIME_DIR, f"{anime_id}.json")
 
-                info['episodes'] = episodes
-                movies.append(info)
+                with open(filename, "w", encoding="utf-8") as f:
+                    json.dump(info, f, ensure_ascii=False, indent=2)
 
-                with open("movies.json", "w", encoding="utf-8") as f:
-                    json.dump(movies, f, ensure_ascii=False, indent=2)
+                index[anime_id] = {"title": info["title"], "file": f"{anime_id}.json"}
+                save_index(index)
+                logging.info(f"Saved [{anime_id}]: {info['title']}")
 
-            except Exception as e:
-                print(f"Anime failed: {e}")
-                exception.append({"error": str(e), "link": link})
+            # update state after each anime
+            state["page"] = page_num
+            state["anime_idx"] = idx + 1
+            save_state(state)
 
+        # reset anime index, move to next page
+        state["anime_idx"] = 0
+        state["page"] = page_num + 1
+        save_state(state)
 
 if __name__ == "__main__":
     main()
