@@ -1,4 +1,7 @@
 movies.json
 /animes
 *.log
-*.json
+animes.json
+state_phase2.json
+state.json
+test.json
